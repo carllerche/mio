@@ -5,48 +5,57 @@ use crate::sys::event::{
     ERROR_FLAGS, READABLE_FLAGS, READ_CLOSED_FLAGS, WRITABLE_FLAGS, WRITE_CLOSED_FLAGS,
 };
 use crate::sys::Events;
+use crate::sys::windows::iocp_handler::{
+    IocpHandler, IocpHandlerRegistry
+};
 use crate::Interest;
 
-use miow::iocp::{CompletionPort, CompletionStatus};
-use miow::Overlapped;
+use miow::iocp::CompletionStatus;
 use std::collections::VecDeque;
 use std::marker::PhantomPinned;
 use std::os::windows::io::RawSocket;
 use std::pin::Pin;
 #[cfg(debug_assertions)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{io, ptr};
 use winapi::shared::ntdef::NT_SUCCESS;
 use winapi::shared::ntdef::{HANDLE, PVOID};
 use winapi::shared::ntstatus::STATUS_CANCELLED;
-use winapi::shared::winerror::{ERROR_INVALID_HANDLE, ERROR_IO_PENDING, WAIT_TIMEOUT};
+use winapi::shared::winerror::{ERROR_INVALID_HANDLE, ERROR_IO_PENDING};
 use winapi::um::minwinbase::OVERLAPPED;
 
 /// Overlapped value to indicate a `Waker` event.
 //
 // Note: this must be null, `SelectorInner::feed_events` depends on it.
-pub const WAKER_OVERLAPPED: *mut Overlapped = ptr::null_mut();
+pub const WAKER_OVERLAPPED: *mut miow::Overlapped = ptr::null_mut();
 
 #[derive(Debug)]
 struct AfdGroup {
-    cp: Arc<CompletionPort>,
+    cp: Arc<IocpHandlerRegistry>,
     afd_group: Mutex<Vec<Arc<Afd>>>,
+    completion_handler: AfdCompletionPortEventHandler,
 }
 
 impl AfdGroup {
-    pub fn new(cp: Arc<CompletionPort>) -> AfdGroup {
+    pub fn new(cp: Arc<IocpHandlerRegistry>, completion_handler: AfdCompletionPortEventHandler) -> AfdGroup {
         AfdGroup {
             afd_group: Mutex::new(Vec::new()),
             cp,
+            completion_handler
         }
     }
 
     pub fn release_unused_afd(&self) {
         let mut afd_group = self.afd_group.lock().unwrap();
         afd_group.retain(|g| Arc::strong_count(&g) > 1);
+    }
+}
+
+impl Drop for AfdGroup {
+    fn drop(&mut self) {
+        self.release_unused_afd();
     }
 }
 
@@ -75,7 +84,7 @@ cfg_net! {
         }
 
         fn _alloc_afd_group(&self, afd_group: &mut Vec<Arc<Afd>>) -> io::Result<()> {
-            let afd = Afd::new(&self.cp)?;
+            let afd = Afd::new(&self.cp, self.completion_handler.clone())?;
             let arc = Arc::new(afd);
             afd_group.push(arc);
             Ok(())
@@ -111,6 +120,37 @@ pub struct SockState {
     error: Option<i32>,
 
     pinned: PhantomPinned,
+}
+
+#[derive(Debug)]
+pub(crate) struct AfdCompletionPortEventHandler {
+    update_queue: Vec<Pin<Arc<Mutex<SockState>>>>,
+    selector_update_queue: Arc<Mutex<VecDeque<Pin<Arc<Mutex<SockState>>>>>>,
+}
+
+impl Clone for AfdCompletionPortEventHandler {
+    fn clone(&self) -> Self {
+        Self {
+            update_queue: Vec::new(),
+            selector_update_queue: Arc::clone(&self.selector_update_queue)
+        }
+    }
+}
+
+impl IocpHandler for AfdCompletionPortEventHandler {
+    fn handle_completion(&mut self, status: &CompletionStatus) -> Option<Event> {
+        let sock_state = from_overlapped(status.overlapped());
+        let mut sock_guard = sock_state.lock().unwrap();
+        let event = sock_guard.feed_event();
+        if !sock_guard.is_pending_deletion() {
+            self.update_queue.push(sock_state.clone());
+        }
+        event
+    }
+
+    fn on_poll_finished(&mut self) {
+        self.selector_update_queue.lock().unwrap().extend(self.update_queue.drain(..));
+    }
 }
 
 impl SockState {
@@ -328,7 +368,7 @@ fn from_overlapped(ptr: *mut OVERLAPPED) -> Pin<Arc<Mutex<SockState>>> {
 #[cfg(debug_assertions)]
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
-/// Windows implementaion of `sys::Selector`
+/// Windows implementation of `sys::Selector`
 ///
 /// Edge-triggered event notification is simulated by resetting internal event flag of each socket state `SockState`
 /// and setting all events back by intercepting all requests that could cause `io::ErrorKind::WouldBlock` happening.
@@ -371,14 +411,233 @@ impl Selector {
         self.inner.select(events, timeout)
     }
 
-    pub(super) fn clone_port(&self) -> Arc<CompletionPort> {
+    pub(super) fn clone_port(&self) -> Arc<IocpHandlerRegistry> {
         self.inner.cp.clone()
     }
 }
 
+cfg_os_util! {
+    use std::fmt;
+    use std::cell::UnsafeCell;
+    use std::os::windows::io::AsRawHandle;
+    use std::ops::BitOr;
+    use std::num::NonZeroU32;
+
+    use winapi::um::minwinbase::OVERLAPPED_ENTRY;
+
+    use crate::poll;
+    use crate::{Registry, Token};
+
+    const OVERLAPPED_CANARY: u32 = 0x5e219f3a;
+
+    /// Holds a set of actions that the sending IOCP client is ready to do.
+    ///
+    /// These can be combined into one `Readiness` instance by using the bitwise or operator '|'.
+    /// However, there is no "not ready" state, i.e. and empty `Readiness`. To indicate the absence of
+    /// any ready operation, use Option<Readiness> and return a None value.
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub struct Readiness {
+        flags: NonZeroU32,
+    }
+
+    impl Readiness {
+        /// Readiness that indicates readiness to read
+        pub const READ: Readiness = Readiness { flags: unsafe { NonZeroU32::new_unchecked(0b_0000_0001) } };
+        /// Readiness that indicates readiness to write
+        pub const WRITE: Readiness = Readiness { flags: unsafe { NonZeroU32::new_unchecked(0b_0000_0010) } };
+
+        /// Checks whether the provided readiness is fulfilled
+        pub fn is_set(&self, readiness: Readiness) -> bool {
+            (self.flags.get() & readiness.flags.get()) == readiness.flags.get()
+        }
+
+        pub(crate) fn into_event(self, token: Token) -> Event {
+            let readable = if self.is_set(Self::READ) { afd::POLL_RECEIVE } else { 0 };
+            let writable = if self.is_set(Self::WRITE) { afd::POLL_SEND } else { 0 };
+            let flags = readable | writable;
+            debug_assert!(flags != 0);
+            Event {
+                data: token.0 as u64,
+                flags
+            }
+        }
+    }
+
+    impl BitOr for Readiness {
+        type Output = Readiness;
+
+        fn bitor(self, rhs: Self) -> Self::Output {
+            // Since neither self nor rhs can be zero (assuming absence of transmuted Readinesses), it's
+            // safe to assume that the result is also nonzero.
+            let flags = unsafe {
+                NonZeroU32::new_unchecked(self.flags.get() | rhs.flags.get())
+            };
+            Readiness { flags }
+        }
+    }
+
+    /// Callback trait for completed IOCP operations.
+    ///
+    /// This trait may be implemented to handle completed IOCP operations. The implementing object may
+    /// signal the readiness for certain operations to the upper layer by returning a `Readiness` value
+    /// that is then converted into `mio::Event` and delivered to the user.
+    ///
+    /// This trait is implemented for closures as well.
+    pub trait CompletionCallback {
+        /// Called on completion of the associated operation.
+        ///
+        /// The callback will be called once the operation that it is bound to via a call to
+        /// `Overlapped::new` has been completed and the IOCP is signalled. By returning a `Readiness`
+        /// value, the callback may deliver a `mio::Event` to the user.
+        fn complete_operation(&mut self, entry: &OVERLAPPED_ENTRY) -> Option<Readiness>;
+    }
+
+    impl<F> CompletionCallback for F where F: FnMut(&OVERLAPPED_ENTRY) -> Option<Readiness> {
+        fn complete_operation(&mut self, entry: &OVERLAPPED_ENTRY) -> Option<Readiness> {
+            (*self)(entry)
+        }
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct RawHandleCompletionHandler {
+        token: Token
+    }
+
+    impl IocpHandler for RawHandleCompletionHandler {
+        fn handle_completion(&mut self, status: &CompletionStatus) -> Option<Event> {
+            let overlapped = status.overlapped() as *mut Overlapped;
+            unsafe {
+                debug_assert!((*overlapped).canary == OVERLAPPED_CANARY);
+                (*overlapped).callback.complete_operation(status.entry())
+                    .map(|r| r.into_event(self.token))
+            }
+        }
+    }
+
+    /// A `Binding` is embedded in all I/O objects associated with a `Registry`.
+    ///
+    /// Each registration keeps track of which selector the I/O object is
+    /// associated with, ensuring that implementations of `Source` can be
+    /// conformant for the various methods on Windows.
+    ///
+    /// If you're working with custom IOCP-enabled objects then you'll want to
+    /// ensure that one of these instances is stored in your object and used in the
+    /// implementation of `Source`.
+    ///
+    /// For more information about how to use this see the `windows` module
+    /// documentation in this crate.
+    #[derive(Debug, Clone)]
+    pub struct Binding {
+        selector: Arc<SelectorInner>,
+        token: Token
+    }
+
+    impl Binding {
+        /// Creates a new blank binding ready to be inserted into an I/O
+        /// object.
+        ///
+        /// Won't actually do anything until `register_handle` has been called during a call to
+        /// `Registry::register`.
+        pub fn new(registry: &Registry, token: Token) -> Self {
+            let selector = poll::selector(registry);
+            Binding { selector: Arc::clone(&selector.inner), token }
+        }
+
+        /// Register a raw windows handle with the IOCP event loop.
+        ///
+        /// The underlying resource needs to support overlapped operations. Thus, files and similar
+        /// entities need to be opened in overlapped mode.
+        ///
+        /// While it is safely possible to call this function more than once it is discouraged to do
+        /// so as the handler will use the same token again when generating events. This makes it hard
+        /// for the user of the registered `Source`.
+        pub fn register_handle<H>(&self, handle: &H) -> io::Result<()> where H: AsRawHandle + ?Sized {
+            let handler = RawHandleCompletionHandler {
+                token: self.token
+            };
+            self.selector.cp.register_handle(handle, handler.into())
+        }
+
+        /// Inject an event to the event loop.
+        ///
+        /// In case it is required to generate an event even though there was no callback due to a
+        /// completed IO operation, this method can be used to mark the associated token as ready, e.g.
+        /// in case it is necessary to signal an initial readiness before any IO operation has been
+        /// scheduled.
+        pub fn inject_event(&self, readiness: Readiness) {
+            let event = readiness.into_event(self.token);
+            self.selector.injected_events.lock().unwrap().push(event)
+        }
+
+        /// Check whether the provided registry is the same as the one used during creation of the
+        /// binding.
+        ///
+        /// IOCP driven sources cannot unregister from their completion port before they get closed.
+        /// Therefore, implementations of reregister and deregister should check whether they have been
+        /// called on the same `Registry` using this method to report errors in case this constraint
+        /// has been violated.
+        pub fn is_same_registry(&self, registry: &Registry) -> bool {
+            Arc::ptr_eq(&self.selector, &poll::selector(registry).inner)
+        }
+    }
+
+    /// A wrapper around an internal instance over `miow::Overlapped` which is in
+    /// turn a wrapper around the Windows type `OVERLAPPED`.
+    ///
+    /// This type is required to be used for all IOCP operations on handles that are
+    /// registered with an event loop. The event loop will receive notifications
+    /// over `OVERLAPPED` pointers that have completed, and it will cast that
+    /// pointer to a pointer to this structure and invoke the associated callback.
+    #[repr(C)]
+    pub struct Overlapped {
+        inner: UnsafeCell<miow::Overlapped>,
+        #[cfg(debug_assertions)]
+        canary: u32,
+        callback: Box<dyn CompletionCallback>,
+    }
+
+    impl fmt::Debug for Overlapped {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Overlapped").finish()
+        }
+    }
+
+    impl Overlapped {
+        /// Creates a new `Overlapped` which will invoke the provided `cb` callback
+        /// whenever it's triggered.
+        ///
+        /// The returned `Overlapped` must be used as the `OVERLAPPED` passed to all
+        /// I/O operations that are registered with mio's event loop. When the I/O
+        /// operation associated with an `OVERLAPPED` pointer completes the event
+        /// loop will invoke the object provided as `callback`.
+        pub fn new<C: CompletionCallback+'static>(callback: C) -> Self {
+            Self {
+                inner: UnsafeCell::new(miow::Overlapped::zero()),
+                #[cfg(debug_assertions)]
+                canary: OVERLAPPED_CANARY,
+                callback: Box::new(callback) as Box<dyn CompletionCallback>,
+            }
+        }
+
+        /// Get the underlying `Overlapped` instance as a raw pointer.
+        ///
+        /// This can be useful when only a shared borrow is held and the overlapped
+        /// pointer needs to be passed down to winapi.
+        pub fn as_mut_ptr(&self) -> *mut OVERLAPPED {
+            unsafe {
+                (*self.inner.get()).raw()
+            }
+        }
+    }
+
+    // Overlapped's APIs are marked as unsafe as they must be used with caution to ensure thread
+    // safety. The structure itself is safe to send across threads.
+    unsafe impl Send for Overlapped {}
+    unsafe impl Sync for Overlapped {}
+}
+
 cfg_net! {
     use super::InternalState;
-    use crate::Token;
 
     impl Selector {
         pub(super) fn register(
@@ -408,8 +667,9 @@ cfg_net! {
 
 #[derive(Debug)]
 pub struct SelectorInner {
-    cp: Arc<CompletionPort>,
-    update_queue: Mutex<VecDeque<Pin<Arc<Mutex<SockState>>>>>,
+    cp: Arc<IocpHandlerRegistry>,
+    update_queue: Arc<Mutex<VecDeque<Pin<Arc<Mutex<SockState>>>>>>,
+    injected_events: Mutex<Vec<Event>>,
     afd_group: AfdGroup,
     is_polling: AtomicBool,
 }
@@ -419,14 +679,20 @@ unsafe impl Sync for SelectorInner {}
 
 impl SelectorInner {
     pub fn new() -> io::Result<SelectorInner> {
-        CompletionPort::new(0).map(|cp| {
+        IocpHandlerRegistry::new().map(|cp| {
             let cp = Arc::new(cp);
             let cp_afd = Arc::clone(&cp);
+            let update_queue = Arc::new(Mutex::new(VecDeque::new()));
+            let completion_handler = AfdCompletionPortEventHandler {
+                selector_update_queue: Arc::clone(&update_queue),
+                update_queue: Vec::new()
+            };
 
             SelectorInner {
                 cp,
-                update_queue: Mutex::new(VecDeque::new()),
-                afd_group: AfdGroup::new(cp_afd),
+                update_queue,
+                injected_events: Mutex::default(),
+                afd_group: AfdGroup::new(cp_afd, completion_handler),
                 is_polling: AtomicBool::new(false),
             }
         })
@@ -462,14 +728,26 @@ impl SelectorInner {
 
         unsafe { self.update_sockets_events() }?;
 
-        let result = self.cp.get_many(statuses, timeout);
+        events.extend(self.injected_events.lock().unwrap().drain(..));
+        // since events was empty before this call, the number of events is the number of injected
+        // events
+        let num_drained_events = events.len();
 
-        self.is_polling.store(false, Ordering::Relaxed);
+        if num_drained_events == 0 {
+            let result = self.cp.handle_pending_events(statuses, Some(events), timeout);
 
-        match result {
-            Ok(iocp_events) => Ok(unsafe { self.feed_events(events, iocp_events) }),
-            Err(ref e) if e.raw_os_error() == Some(WAIT_TIMEOUT as i32) => Ok(0),
-            Err(e) => Err(e),
+            self.is_polling.store(false, Ordering::Relaxed);
+
+            match result {
+                Ok(num_events) => {
+                    self.afd_group.release_unused_afd();
+                    Ok(num_events + num_drained_events)
+                },
+                Err(e) => Err(e),
+            }
+        } else {
+            self.is_polling.store(false, Ordering::Relaxed);
+            Ok(num_drained_events)
         }
     }
 
@@ -487,43 +765,6 @@ impl SelectorInner {
 
         self.afd_group.release_unused_afd();
         Ok(())
-    }
-
-    // It returns processed count of iocp_events rather than the events itself.
-    unsafe fn feed_events(
-        &self,
-        events: &mut Vec<Event>,
-        iocp_events: &[CompletionStatus],
-    ) -> usize {
-        let mut n = 0;
-        let mut update_queue = self.update_queue.lock().unwrap();
-        for iocp_event in iocp_events.iter() {
-            if iocp_event.overlapped().is_null() {
-                // `Waker` event, we'll add a readable event to match the other platforms.
-                events.push(Event {
-                    flags: afd::POLL_RECEIVE,
-                    data: iocp_event.token() as u64,
-                });
-                n += 1;
-                continue;
-            }
-
-            let sock_state = from_overlapped(iocp_event.overlapped());
-            let mut sock_guard = sock_state.lock().unwrap();
-            match sock_guard.feed_event() {
-                Some(e) => {
-                    events.push(e);
-                    n += 1;
-                }
-                None => {}
-            }
-
-            if !sock_guard.is_pending_deletion() {
-                update_queue.push_back(sock_state.clone());
-            }
-        }
-        self.afd_group.release_unused_afd();
-        n
     }
 }
 
@@ -686,35 +927,23 @@ cfg_net! {
 impl Drop for SelectorInner {
     fn drop(&mut self) {
         loop {
-            let events_num: usize;
             let mut statuses: [CompletionStatus; 1024] = [CompletionStatus::zero(); 1024];
 
             let result = self
                 .cp
-                .get_many(&mut statuses, Some(std::time::Duration::from_millis(0)));
+                .handle_pending_events(&mut statuses, None, Some(Duration::from_millis(0)));
             match result {
-                Ok(iocp_events) => {
-                    events_num = iocp_events.iter().len();
-                    for iocp_event in iocp_events.iter() {
-                        if !iocp_event.overlapped().is_null() {
-                            // drain sock state to release memory of Arc reference
-                            let _sock_state = from_overlapped(iocp_event.overlapped());
-                        }
-                    }
-                }
+                Ok(events_num) if events_num == 0 => {
+                    break
+                },
+
+                Ok(_) => (),
 
                 Err(_) => {
                     break;
                 }
             }
-
-            if events_num == 0 {
-                // continue looping until all completion statuses have been drained
-                break;
-            }
         }
-
-        self.afd_group.release_unused_afd();
     }
 }
 

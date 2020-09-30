@@ -89,6 +89,68 @@ pub mod unix {
     pub use crate::sys::SourceFd;
 }
 
+cfg_any_os_util! {
+/// Windows-only extensions to the mio crate.
+///
+/// Mio on windows is currently implemented with IOCP for a high-performance
+/// implementation of asynchronous I/O. On top of the IOCP, a connection to the "Ancillary Function
+/// Driver" provides socket services. However, this approach doesn't work for other handle types
+/// like files and named pipes. They need to be connected directly to the IO completion port like
+/// this is done on unix-like systems  with the `SourceFd` type. The purpose of this module is to
+/// similarly provide a mechanism for foreign I/O types to get hooked up into the IOCP event loop.
+///
+/// This module provides types for interfacing with a custom IOCP handle:
+///
+/// * `Binding` - this type is intended to govern binding with mio's `Registry`
+///   type. Each I/O object should contain an instance of `Binding` that's
+///   interfaced with for the implementation of the `Source` trait. The
+///   `register`, `reregister`, and `deregister` methods for the `Source` trait
+///   may use methods provided by `Binding` during their operations.
+///
+///   Also note that for types which represent streams of bytes the mio
+///   interface of *readiness* doesn't map directly to the Windows model of
+///   *completion*. This means that types will have to perform internal
+///   buffering to ensure that a readiness interface can be provided.
+///
+/// * `Overlapped` - this type is intended to be used as the concrete instances
+///   of the `OVERLAPPED` type that most win32 methods expect. It's crucial, for
+///   safety, that all asynchronous operations are initiated with an instance of
+///   `Overlapped` and not another instantiation of `OVERLAPPED`.
+///
+///   Mio's `Overlapped` type is created with an object implementing `CompletionHandler` that
+///   is notified on completion of the associated asynchronous operation. The provided
+///   `OVERLAPPED_ENTRY` type is defined in the `winapi` crate. Whenever a completion is posted to
+///   an IOCP object the `OVERLAPPED` that was signaled will be interpreted as
+///   `Overlapped` in the mio crate and the `CompletionHandler` will be invoked.
+///   Through this object, and through the `OVERLAPPED` pointer, implementations can handle
+///   management of I/O events.
+///
+/// * `Readiness` - this type is used to indicate whether an IOCP client is ready to start the next
+///   IO operation. This is done either by returning a `Readiness` value from the
+///   `CompletionHandler` or by using `Binding::inject_event`.
+///
+/// * `CompletionHandler` - this trait is implemented by the IOCP client and is used as a callback
+///   when an asynchronous operation has finished. Currently it only implements one callback but may
+///   be extended in the future.
+///
+/// When put together these types enable custom Windows handles to be
+/// registered with mio's event loops. The `Binding` type is used to associate
+/// handles and the `Overlapped` type is used to execute I/O operations. When
+/// the I/O operations are completed an object implementing `CompletionHandler` is called which
+/// typically emits a `Readiness` that is then reported to the user who then may start the next
+/// asynchronous operation.
+#[cfg(windows)]
+    pub mod windows {
+        //! Windows only extensions.
+        pub use crate::sys::{
+            Binding,
+            CompletionCallback,
+            Overlapped,
+            Readiness,
+        };
+    }
+}
+
 // Enable with `cargo doc --features extra-docs`.
 #[cfg(feature = "extra-docs")]
 pub mod features {

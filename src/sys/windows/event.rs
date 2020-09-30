@@ -5,6 +5,7 @@ use miow::iocp::CompletionStatus;
 use super::afd;
 use crate::Token;
 
+#[derive(Debug)]
 pub struct Event {
     pub flags: u32,
     pub data: u64,

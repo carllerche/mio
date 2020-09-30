@@ -80,7 +80,27 @@ cfg_os_poll! {
 #[cfg(windows)]
 cfg_os_poll! {
     mod windows;
-    pub(crate) use self::windows::*;
+    pub(crate) use self::windows::{Waker, Event, Events, event, Selector};
+    cfg_any_os_util! {
+        pub use self::windows::{
+            Binding,
+            CompletionCallback,
+            Overlapped,
+            Readiness,
+        };
+    }
+
+    cfg_net! {
+        pub(crate) use self::windows::IoSourceState;
+    }
+
+    cfg_tcp! {
+        pub(crate) use self::windows::tcp;
+    }
+
+    cfg_udp! {
+        pub(crate) use self::windows::udp;
+    }
 }
 
 cfg_not_os_poll! {

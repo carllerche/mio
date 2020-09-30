@@ -70,6 +70,17 @@ macro_rules! cfg_udp {
     }
 }
 
+/// Feature `os-util` enabled.
+macro_rules! cfg_os_util {
+    ($($item:item)*) => {
+        $(
+            #[cfg(feature = "os-util")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "os-util")))]
+            $item
+        )*
+    }
+}
+
 /// Feature `uds` enabled.
 #[cfg(unix)]
 macro_rules! cfg_uds {

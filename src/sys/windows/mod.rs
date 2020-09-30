@@ -7,6 +7,12 @@ pub use event::{Event, Events};
 mod selector;
 pub use selector::{Selector, SelectorInner, SockState};
 
+mod iocp_handler;
+
+cfg_any_os_util! {
+    pub use selector::{CompletionCallback, Overlapped, Readiness, Binding};
+}
+
 // Macros must be defined before the modules that use them
 cfg_net! {
     /// Helper macro to execute a system call that returns an `io::Result`.

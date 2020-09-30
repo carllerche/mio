@@ -114,17 +114,17 @@ impl Afd {
 }
 
 cfg_net! {
-    use miow::iocp::CompletionPort;
     use ntapi::ntioapi::FILE_OPEN;
     use ntapi::ntioapi::NtCreateFile;
     use std::mem::zeroed;
     use std::os::windows::io::{FromRawHandle, RawHandle};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use winapi::shared::ntdef::{OBJECT_ATTRIBUTES, UNICODE_STRING, USHORT, WCHAR};
     use winapi::um::handleapi::INVALID_HANDLE_VALUE;
     use winapi::um::winbase::{SetFileCompletionNotificationModes, FILE_SKIP_SET_EVENT_ON_HANDLE};
     use winapi::um::winnt::SYNCHRONIZE;
     use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    use super::iocp_handler::IocpHandlerRegistry;
+    use super::selector::AfdCompletionPortEventHandler;
 
     const AFD_HELPER_ATTRIBUTES: OBJECT_ATTRIBUTES = OBJECT_ATTRIBUTES {
         Length: size_of::<OBJECT_ATTRIBUTES>() as ULONG,
@@ -159,8 +159,6 @@ cfg_net! {
         'o' as _
     ];
 
-    static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(0);
-
     impl AfdPollInfo {
         pub fn zeroed() -> AfdPollInfo {
             unsafe { zeroed() }
@@ -169,7 +167,7 @@ cfg_net! {
 
     impl Afd {
         /// Create new Afd instance.
-        pub fn new(cp: &CompletionPort) -> io::Result<Afd> {
+        pub(crate) fn new(cp: &IocpHandlerRegistry, handler: AfdCompletionPortEventHandler) -> io::Result<Afd> {
             let mut afd_helper_handle: HANDLE = INVALID_HANDLE_VALUE;
             let mut iosb = IO_STATUS_BLOCK {
                 u: IO_STATUS_BLOCK_u { Status: 0 },
@@ -196,9 +194,8 @@ cfg_net! {
                     ));
                 }
                 let fd = File::from_raw_handle(afd_helper_handle as RawHandle);
-                let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed) + 1;
                 let afd = Afd { fd };
-                cp.add_handle(token, &afd.fd)?;
+                cp.register_handle(&afd.fd, handler.into())?;
                 match SetFileCompletionNotificationModes(
                     afd_helper_handle,
                     FILE_SKIP_SET_EVENT_ON_HANDLE,
