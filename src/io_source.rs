@@ -1,6 +1,8 @@
 use std::ops::{Deref, DerefMut};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "wasi")]
+use std::os::wasi::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
 #[cfg(debug_assertions)]
@@ -195,6 +197,40 @@ where
         #[cfg(debug_assertions)]
         self.selector_id.remove_association(_registry)?;
         self.state.deregister()
+    }
+}
+
+#[cfg(target_os = "wasi")]
+impl<T> event::Source for IoSource<T>
+where
+    T: AsRawFd,
+{
+    fn register(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        #[cfg(debug_assertions)]
+        self.selector_id.associate(registry)?;
+        poll::selector(registry).register(self.inner.as_raw_fd(), token, interests)
+    }
+
+    fn reregister(
+        &mut self,
+        registry: &Registry,
+        token: Token,
+        interests: Interest,
+    ) -> io::Result<()> {
+        #[cfg(debug_assertions)]
+        self.selector_id.check_association(registry)?;
+        poll::selector(registry).reregister(self.inner.as_raw_fd(), token, interests)
+    }
+
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        #[cfg(debug_assertions)]
+        self.selector_id.remove_association(registry)?;
+        poll::selector(registry).deregister(self.inner.as_raw_fd())
     }
 }
 

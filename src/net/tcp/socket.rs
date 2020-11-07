@@ -1,14 +1,17 @@
-use crate::net::{TcpStream, TcpListener};
-use crate::sys;
-
 use std::io;
 use std::mem;
 use std::net::SocketAddr;
 use std::time::Duration;
+
 #[cfg(unix)]
-use std::os::unix::io::{AsRawFd, RawFd, FromRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+#[cfg(target_os = "wasi")]
+use std::os::wasi::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket};
+
+use crate::net::{TcpListener, TcpStream};
+use crate::sys;
 
 /// A non-blocking TCP socket used to configure a stream or listener.
 ///
@@ -27,18 +30,14 @@ impl TcpSocket {
     ///
     /// This calls `socket(2)`.
     pub fn new_v4() -> io::Result<TcpSocket> {
-        sys::tcp::new_v4_socket().map(|sys| TcpSocket {
-            sys
-        })
+        sys::tcp::new_v4_socket().map(|sys| TcpSocket { sys })
     }
 
     /// Create a new IPv6 TCP socket.
     ///
     /// This calls `socket(2)`.
     pub fn new_v6() -> io::Result<TcpSocket> {
-        sys::tcp::new_v6_socket().map(|sys| TcpSocket {
-            sys
-        })
+        sys::tcp::new_v6_socket().map(|sys| TcpSocket { sys })
     }
 
     pub(crate) fn new_for_addr(addr: SocketAddr) -> io::Result<TcpSocket> {
@@ -168,7 +167,7 @@ impl TcpSocket {
     pub fn get_send_buffer_size(&self) -> io::Result<u32> {
         sys::tcp::get_send_buffer_size(self.sys)
     }
-    
+
     /// Returns the local address of this socket
     ///
     /// Will return `Err` result in windows if called before calling `bind`
@@ -180,6 +179,16 @@ impl TcpSocket {
 impl Drop for TcpSocket {
     fn drop(&mut self) {
         sys::tcp::close(self.sys);
+    }
+}
+
+#[cfg(unix)]
+impl IntoRawFd for TcpSocket {
+    fn into_raw_fd(self) -> RawFd {
+        let ret = self.sys;
+        // Avoid closing the socket
+        mem::forget(self);
+        ret
     }
 }
 
@@ -235,6 +244,38 @@ impl FromRawSocket for TcpSocket {
     /// The caller is responsible for ensuring that the socket is in
     /// non-blocking mode.
     unsafe fn from_raw_socket(socket: RawSocket) -> TcpSocket {
-        TcpSocket { sys: socket as sys::tcp::TcpSocket }
+        TcpSocket {
+            sys: socket as sys::tcp::TcpSocket,
+        }
+    }
+}
+
+#[cfg(target_os = "wasi")]
+impl IntoRawFd for TcpSocket {
+    fn into_raw_fd(self) -> RawFd {
+        let ret = self.sys;
+        // Avoid closing the socket
+        mem::forget(self);
+        ret
+    }
+}
+
+#[cfg(target_os = "wasi")]
+impl AsRawFd for TcpSocket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.sys
+    }
+}
+
+#[cfg(target_os = "wasi")]
+impl FromRawFd for TcpSocket {
+    /// Converts a `RawFd` to a `TcpSocket`.
+    ///
+    /// # Notes
+    ///
+    /// The caller is responsible for ensuring that the socket is in
+    /// non-blocking mode.
+    unsafe fn from_raw_fd(fd: RawFd) -> TcpSocket {
+        TcpSocket { sys: fd }
     }
 }

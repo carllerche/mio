@@ -41,6 +41,8 @@
 //!
 //! The available features are described in the [`features`] module.
 
+#![feature(wasi_ext)]
+
 // macros used internally
 #[macro_use]
 mod macros;
