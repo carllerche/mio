@@ -7,17 +7,19 @@
 //!
 //! [portability guidelines]: ../struct.Poll.html#portability
 
-use crate::io_source::IoSource;
-use crate::{event, sys, Interest, Registry, Token};
-
-use std::fmt;
-use std::io;
-use std::net;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::mem::MaybeUninit;
+use std::net::{self, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket};
+use std::{fmt, io};
+
+use socket2::{Domain, Protocol, Socket, Type};
+
+use crate::io_source::IoSource;
+use crate::net::convert_address;
+use crate::{event, Interest, Registry, Token};
 
 /// A User Datagram Protocol socket.
 ///
@@ -36,9 +38,11 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket}
 /// // SENDER -> sends a message.
 /// // ECHOER -> listens and prints the message received.
 ///
+/// use std::time::Duration;
+/// use std::mem::MaybeUninit;
+///
 /// use mio::net::UdpSocket;
 /// use mio::{Events, Interest, Poll, Token};
-/// use std::time::Duration;
 ///
 /// const SENDER: Token = Token(0);
 /// const ECHOER: Token = Token(1);
@@ -61,7 +65,7 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket}
 /// poll.registry().register(&mut echoer_socket, ECHOER, Interest::READABLE)?;
 ///
 /// let msg_to_send = [9; 9];
-/// let mut buffer = [0; 9];
+/// let mut buffer = [MaybeUninit::uninit(); 9];
 ///
 /// let mut events = Events::with_capacity(128);
 /// loop {
@@ -78,7 +82,6 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket}
 ///             ECHOER => {
 ///                 let num_recv = echoer_socket.recv(&mut buffer)?;
 ///                 println!("echo {:?} -> {:?}", buffer, num_recv);
-///                 buffer = [0; 9];
 ///                 # drop(buffer); // Silence unused assignment warning.
 ///                 # return Ok(());
 ///             }
@@ -89,7 +92,7 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket}
 /// # }
 /// ```
 pub struct UdpSocket {
-    inner: IoSource<net::UdpSocket>,
+    inner: IoSource<Socket>,
 }
 
 impl UdpSocket {
@@ -118,8 +121,38 @@ impl UdpSocket {
     /// #    Ok(())
     /// # }
     /// ```
-    pub fn bind(addr: SocketAddr) -> io::Result<UdpSocket> {
-        sys::udp::bind(addr).map(UdpSocket::from_std)
+    pub fn bind(address: SocketAddr) -> io::Result<UdpSocket> {
+        let ty = Type::DGRAM;
+        // Use `SOCK_NONBLOCK` on platforms that support it.
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "linux",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        let ty = ty.nonblocking();
+        let domain = Domain::for_address(address);
+        let socket = Socket::new(domain, ty, Some(Protocol::UDP))?;
+        // Platforms that don't support `SOCK_NONBLOCK`.
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "linux",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        )))]
+        socket.set_nonblocking(true)?;
+        socket.bind(&address.into())?;
+        Ok(UdpSocket {
+            inner: IoSource::new(socket),
+        })
     }
 
     /// Creates a new `UdpSocket` from a standard `net::UdpSocket`.
@@ -130,7 +163,7 @@ impl UdpSocket {
     /// non-blocking mode.
     pub fn from_std(socket: net::UdpSocket) -> UdpSocket {
         UdpSocket {
-            inner: IoSource::new(socket),
+            inner: IoSource::new(socket.into()),
         }
     }
 
@@ -158,7 +191,7 @@ impl UdpSocket {
     /// # }
     /// ```
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
+        self.inner.local_addr().and_then(convert_address)
     }
 
     /// Returns the socket address of the remote peer this socket was connected to.
@@ -181,7 +214,7 @@ impl UdpSocket {
     /// # }
     /// ```
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.peer_addr()
+        self.inner.peer_addr().and_then(convert_address)
     }
 
     /// Sends data on the socket to the given address. On success, returns the
@@ -209,7 +242,7 @@ impl UdpSocket {
     /// # }
     /// ```
     pub fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
-        self.inner.do_io(|inner| inner.send_to(buf, target))
+        self.inner.do_io(|inner| inner.send_to(buf, &target.into()))
     }
 
     /// Receives data from the socket. On success, returns the number of bytes
@@ -223,12 +256,18 @@ impl UdpSocket {
     /// Make sure to always use a sufficiently large buffer to hold the
     /// maximum UDP packet size, which can be up to 65536 bytes in size.
     ///
+    /// When passing a zero-length buffer the OS might not initialise the source
+    /// address, this renders Mio unable to covert it into a
+    /// `std::net::SocketAddr` and instead return a misleading error saying the
+    /// 'address family' is invalid.
+    ///
     /// # Examples
     ///
     /// ```no_run
     /// # use std::error::Error;
     /// #
     /// # fn main() -> Result<(), Box<dyn Error>> {
+    /// use std::mem::MaybeUninit;
     /// use mio::net::UdpSocket;
     ///
     /// let socket = UdpSocket::bind("127.0.0.1:0".parse()?)?;
@@ -236,15 +275,27 @@ impl UdpSocket {
     /// // We must check if the socket is readable before calling recv_from,
     /// // or we could run into a WouldBlock error.
     ///
-    /// let mut buf = [0; 9];
+    /// let mut buf = [MaybeUninit::uninit(); 10];
     /// let (num_recv, from_addr) = socket.recv_from(&mut buf)?;
+    /// let buf = &buf[0..num_recv];
+    /// // You can also use `MaybeUninit::slice_assume_init_ref`.
+    /// let buf = unsafe { &*(buf as *const [MaybeUninit<u8>] as *const [u8]) };
     /// println!("Received {:?} -> {:?} bytes from {:?}", buf, num_recv, from_addr);
-    /// #
     /// #    Ok(())
     /// # }
     /// ```
-    pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.inner.do_io(|inner| inner.recv_from(buf))
+    pub fn recv_from(&self, buf: &mut [MaybeUninit<u8>]) -> io::Result<(usize, SocketAddr)> {
+        // When receiving into a zero-length buffer the address will not be
+        // initialised by the OS (at least not on macOS). Which means that it
+        // can't be converted into a `std::net::SocketAddr` properly and
+        // `convert_address` will return a misleading error.
+        debug_assert!(
+            !buf.is_empty(),
+            "called mio::UdpSocket::recv_from with an empty buffer"
+        );
+        self.inner
+            .do_io(|inner| inner.recv_from(buf))
+            .and_then(|(n, address)| convert_address(address).map(|address| (n, address)))
     }
 
     /// Receives data from the socket, without removing it from the input queue.
@@ -265,6 +316,7 @@ impl UdpSocket {
     /// # use std::error::Error;
     /// #
     /// # fn main() -> Result<(), Box<dyn Error>> {
+    /// use std::mem::MaybeUninit;
     /// use mio::net::UdpSocket;
     ///
     /// let socket = UdpSocket::bind("127.0.0.1:0".parse()?)?;
@@ -272,15 +324,19 @@ impl UdpSocket {
     /// // We must check if the socket is readable before calling recv_from,
     /// // or we could run into a WouldBlock error.
     ///
-    /// let mut buf = [0; 9];
+    /// let mut buf = [MaybeUninit::uninit(); 10];
     /// let (num_recv, from_addr) = socket.peek_from(&mut buf)?;
+    /// let buf = &buf[0..num_recv];
+    /// // You can also use `MaybeUninit::slice_assume_init_ref`.
+    /// let buf = unsafe { &*(buf as *const [MaybeUninit<u8>] as *const [u8]) };
     /// println!("Received {:?} -> {:?} bytes from {:?}", buf, num_recv, from_addr);
-    /// #
     /// #    Ok(())
     /// # }
     /// ```
-    pub fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.inner.do_io(|inner| inner.peek_from(buf))
+    pub fn peek_from(&self, buf: &mut [MaybeUninit<u8>]) -> io::Result<(usize, SocketAddr)> {
+        self.inner
+            .do_io(|inner| inner.peek_from(buf))
+            .and_then(|(n, address)| convert_address(address).map(|address| (n, address)))
     }
 
     /// Sends data on the socket to the address previously bound via connect(). On success,
@@ -299,7 +355,7 @@ impl UdpSocket {
     /// WSAEMSGSIZE(10040). The excess data is lost.
     /// Make sure to always use a sufficiently large buffer to hold the
     /// maximum UDP packet size, which can be up to 65536 bytes in size.
-    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+    pub fn recv(&self, buf: &mut [MaybeUninit<u8>]) -> io::Result<usize> {
         self.inner.do_io(|inner| inner.recv(buf))
     }
 
@@ -313,7 +369,7 @@ impl UdpSocket {
     /// WSAEMSGSIZE(10040). The excess data is lost.
     /// Make sure to always use a sufficiently large buffer to hold the
     /// maximum UDP packet size, which can be up to 65536 bytes in size.
-    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+    pub fn peek(&self, buf: &mut [MaybeUninit<u8>]) -> io::Result<usize> {
         self.inner.do_io(|inner| inner.peek(buf))
     }
 
@@ -321,7 +377,7 @@ impl UdpSocket {
     /// and limiting packets that are read via `recv` from the address specified
     /// in `addr`.
     pub fn connect(&self, addr: SocketAddr) -> io::Result<()> {
-        self.inner.connect(addr)
+        self.inner.connect(&addr.into())
     }
 
     /// Sets the value of the `SO_BROADCAST` option for this socket.
@@ -497,7 +553,6 @@ impl UdpSocket {
     /// address of the local interface with which the system should join the
     /// multicast group. If it's equal to `INADDR_ANY` then an appropriate
     /// interface is chosen by the system.
-    #[allow(clippy::trivially_copy_pass_by_ref)]
     pub fn join_multicast_v4(&self, multiaddr: &Ipv4Addr, interface: &Ipv4Addr) -> io::Result<()> {
         self.inner.join_multicast_v4(multiaddr, interface)
     }
@@ -507,7 +562,6 @@ impl UdpSocket {
     /// This function specifies a new multicast group for this socket to join.
     /// The address must be a valid multicast address, and `interface` is the
     /// index of the interface to join/leave (or 0 to indicate any interface).
-    #[allow(clippy::trivially_copy_pass_by_ref)]
     pub fn join_multicast_v6(&self, multiaddr: &Ipv6Addr, interface: u32) -> io::Result<()> {
         self.inner.join_multicast_v6(multiaddr, interface)
     }
@@ -518,7 +572,6 @@ impl UdpSocket {
     /// [`join_multicast_v4`][link].
     ///
     /// [link]: #method.join_multicast_v4
-    #[allow(clippy::trivially_copy_pass_by_ref)]
     pub fn leave_multicast_v4(&self, multiaddr: &Ipv4Addr, interface: &Ipv4Addr) -> io::Result<()> {
         self.inner.leave_multicast_v4(multiaddr, interface)
     }
@@ -529,15 +582,13 @@ impl UdpSocket {
     /// [`join_multicast_v6`][link].
     ///
     /// [link]: #method.join_multicast_v6
-    #[allow(clippy::trivially_copy_pass_by_ref)]
     pub fn leave_multicast_v6(&self, multiaddr: &Ipv6Addr, interface: u32) -> io::Result<()> {
         self.inner.leave_multicast_v6(multiaddr, interface)
     }
 
     /// Get the value of the `IPV6_V6ONLY` option on this socket.
-    #[allow(clippy::trivially_copy_pass_by_ref)]
     pub fn only_v6(&self) -> io::Result<bool> {
-        sys::udp::only_v6(&self.inner)
+        self.inner.only_v6()
     }
 
     /// Get the value of the `SO_ERROR` option on this socket.
@@ -603,7 +654,9 @@ impl FromRawFd for UdpSocket {
     /// The caller is responsible for ensuring that the socket is in
     /// non-blocking mode.
     unsafe fn from_raw_fd(fd: RawFd) -> UdpSocket {
-        UdpSocket::from_std(FromRawFd::from_raw_fd(fd))
+        UdpSocket {
+            inner: IoSource::new(Socket::from_raw_fd(fd)),
+        }
     }
 }
 
@@ -630,6 +683,8 @@ impl FromRawSocket for UdpSocket {
     /// The caller is responsible for ensuring that the socket is in
     /// non-blocking mode.
     unsafe fn from_raw_socket(socket: RawSocket) -> UdpSocket {
-        UdpSocket::from_std(FromRawSocket::from_raw_socket(socket))
+        UdpSocket {
+            inner: IoSource::new(Socket::from_raw_socket(socket)),
+        }
     }
 }

@@ -29,7 +29,6 @@ cfg_net! {
     mod net;
 
     pub(crate) mod tcp;
-    pub(crate) mod udp;
 }
 
 cfg_os_ext! {

@@ -2,6 +2,7 @@
 #![allow(dead_code, unused_macros)]
 #![cfg(any(feature = "os-poll", feature = "net"))]
 
+use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::ops::BitOr;
 #[cfg(unix)]
@@ -250,6 +251,29 @@ fn temp_dir() -> PathBuf {
     path
 }
 
+/// Assume the `buf`fer to be initialised.
+pub unsafe fn assume_init<B: AssumeBytes + ?Sized>(buf: &B) -> &[u8] {
+    buf.assume()
+}
+
+// TODO: remove this trait once all net types use `MaybeUninit` in recv methods.
+pub trait AssumeBytes {
+    unsafe fn assume(&self) -> &[u8];
+}
+
+impl AssumeBytes for [MaybeUninit<u8>] {
+    unsafe fn assume(&self) -> &[u8] {
+        // TODO: replace with `MaybeUninit::slice_assume_init_ref` once stable.
+        &*(self as *const [MaybeUninit<u8>] as *const [u8])
+    }
+}
+
+impl AssumeBytes for [u8] {
+    unsafe fn assume(&self) -> &[u8] {
+        self
+    }
+}
+
 /// A checked {write, send, send_to} macro that ensures the entire buffer is
 /// written.
 ///
@@ -276,7 +300,7 @@ macro_rules! expect_read {
             .expect("unable to read from socket");
         let expected = $expected;
         assert_eq!(n, expected.len());
-        assert_eq!(&$buf[..n], expected);
+        assert_eq!(unsafe { $crate::util::assume_init(&$buf[..n]) }, expected);
     }};
     // TODO: change the call sites to check the source address.
     // Support for recv_from and peek_from, without checking the address.
@@ -285,7 +309,7 @@ macro_rules! expect_read {
             .expect("unable to read from socket");
         let expected = $expected;
         assert_eq!(n, expected.len());
-        assert_eq!(&$buf[..n], expected);
+        assert_eq!(unsafe { $crate::util::assume_init(&$buf[..n]) }, expected);
     }};
     // Support for recv_from and peek_from for `UnixDatagram`s.
     ($socket: ident . $method: ident ( $buf: expr $(, $arg: expr)* ), $expected: expr, path: $source: expr) => {{
@@ -307,7 +331,7 @@ macro_rules! expect_read {
         let expected = $expected;
         let source = $source;
         assert_eq!(n, expected.len());
-        assert_eq!(&$buf[..n], expected);
+        assert_eq!(unsafe { $crate::util::assume_init(&$buf[..n]) }, expected);
         assert_eq!(address, source);
     }};
 }

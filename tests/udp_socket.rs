@@ -1,15 +1,17 @@
 #![cfg(all(feature = "os-poll", feature = "net"))]
 
-use log::{debug, info};
-use mio::net::UdpSocket;
-use mio::{Events, Interest, Poll, Registry, Token};
+use std::mem::MaybeUninit;
 use std::net::{self, IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
-use std::str;
 use std::sync::{Arc, Barrier};
-use std::thread;
 use std::time::Duration;
+use std::{slice, str, thread};
+
+use log::{debug, info};
+
+use mio::net::UdpSocket;
+use mio::{Events, Interest, Poll, Registry, Token};
 
 #[macro_use]
 mod util;
@@ -41,7 +43,7 @@ fn assert_size() {
 }
 
 #[test]
-fn empty_datagram() {
+fn send_empty_datagram() {
     const EMPTY: &[u8] = b"";
 
     let (mut poll, mut events) = init_with_poll();
@@ -63,13 +65,12 @@ fn empty_datagram() {
 
     checked_write!(s1.send_to(EMPTY, s2.local_addr().unwrap()));
 
-    let mut buf = [0; 10];
-
     expect_events(
         &mut poll,
         &mut events,
         vec![ExpectEvent::new(ID2, Interest::READABLE)],
     );
+    let mut buf = [MaybeUninit::uninit(); 10];
     expect_read!(s2.recv_from(&mut buf), EMPTY, s1.local_addr().unwrap());
 }
 
@@ -143,7 +144,7 @@ fn smoke_test_unconnected_udp_socket(mut socket1: UdpSocket, mut socket2: UdpSoc
         ],
     );
 
-    let mut buf = [0; 20];
+    let mut buf = [MaybeUninit::uninit(); 20];
     assert_would_block(socket1.peek_from(&mut buf));
     assert_would_block(socket1.recv_from(&mut buf));
 
@@ -356,7 +357,7 @@ fn smoke_test_connected_udp_socket(mut socket1: UdpSocket, mut socket2: UdpSocke
         ],
     );
 
-    let mut buf = [0; 20];
+    let mut buf = [MaybeUninit::uninit(); 20];
     assert_would_block(socket1.peek(&mut buf));
     assert_would_block(socket1.recv(&mut buf));
 
@@ -372,7 +373,6 @@ fn smoke_test_connected_udp_socket(mut socket1: UdpSocket, mut socket2: UdpSocke
         ],
     );
 
-    let mut buf = [0; 20];
     expect_read!(socket1.peek(&mut buf), DATA2);
     expect_read!(socket2.peek(&mut buf), DATA1);
 
@@ -427,7 +427,7 @@ fn reconnect_udp_socket_sending() {
         vec![ExpectEvent::new(ID2, Interest::READABLE)],
     );
 
-    let mut buf = [0; 20];
+    let mut buf = [MaybeUninit::uninit(); 20];
     expect_read!(socket2.recv(&mut buf), DATA1);
 
     socket1.connect(address3).unwrap();
@@ -489,7 +489,7 @@ fn reconnect_udp_socket_receiving() {
         vec![ExpectEvent::new(ID1, Interest::READABLE)],
     );
 
-    let mut buf = [0; 20];
+    let mut buf = [MaybeUninit::uninit(); 20];
     expect_read!(socket1.recv(&mut buf), DATA1);
 
     //this will reregister socket1 resetting the interests
@@ -573,7 +573,7 @@ fn unconnected_udp_socket_connected_methods() {
 
     // Receive methods don't require the socket to be connected, you just won't
     // know the sender.
-    let mut buf = [0; 20];
+    let mut buf = [MaybeUninit::uninit(); 20];
     expect_read!(socket2.peek(&mut buf), DATA1);
     expect_read!(socket2.recv(&mut buf), DATA1);
 
@@ -631,13 +631,21 @@ fn connected_udp_socket_unconnected_methods() {
         vec![ExpectEvent::new(ID3, Interest::READABLE)],
     );
 
-    let mut buf = [0; 20];
+    let mut buf = [MaybeUninit::uninit(); 20];
     expect_read!(socket3.peek_from(&mut buf), DATA2, address2);
     expect_read!(socket3.recv_from(&mut buf), DATA2, address2);
 
     assert!(socket1.take_error().unwrap().is_none());
     assert!(socket2.take_error().unwrap().is_none());
     assert!(socket3.take_error().unwrap().is_none());
+}
+
+#[test]
+#[should_panic]
+#[cfg(debug_assertions)]
+fn recv_from_empty_buffer() {
+    let socket = UdpSocket::bind(any_local_address()).unwrap();
+    socket.recv_from(&mut []).unwrap();
 }
 
 #[cfg(unix)]
@@ -701,7 +709,7 @@ fn udp_socket_reregister() {
         vec![ExpectEvent::new(ID2, Interest::READABLE)],
     );
 
-    let mut buf = [0; 20];
+    let mut buf = [MaybeUninit::uninit(); 20];
     expect_read!(socket.recv_from(&mut buf), DATA1, __anywhere);
 
     thread_handle.join().expect("unable to join thread");
@@ -729,7 +737,7 @@ fn udp_socket_no_events_after_deregister() {
     expect_no_events(&mut poll, &mut events);
 
     // But we do expect a packet to be send.
-    let mut buf = [0; 20];
+    let mut buf = [MaybeUninit::uninit(); 20];
     expect_read!(socket.recv_from(&mut buf), DATA1, __anywhere);
 
     thread_handle.join().expect("unable to join thread");
@@ -782,7 +790,7 @@ fn send_recv_udp(mut tx: UdpSocket, mut rx: UdpSocket, connected: bool) {
     let mut poll = Poll::new().unwrap();
 
     // ensure that the sockets are non-blocking
-    let mut buf = [0; 128];
+    let mut buf = [MaybeUninit::uninit(); 128];
     assert_would_block(rx.recv_from(&mut buf));
 
     info!("Registering SENDER");
@@ -807,10 +815,17 @@ fn send_recv_udp(mut tx: UdpSocket, mut rx: UdpSocket, connected: bool) {
             if event.is_readable() {
                 if let LISTENER = event.token() {
                     debug!("We are receiving a datagram now...");
+                    // TODO: replace with `Vec::spare_capacity_mut` once stable.
+                    let rx_buf = unsafe {
+                        slice::from_raw_parts_mut(
+                            handler.rx_buf.as_mut_ptr() as *mut MaybeUninit<u8>,
+                            handler.rx_buf.capacity(),
+                        )
+                    };
                     let cnt = if !handler.connected {
-                        handler.rx.recv_from(&mut handler.rx_buf).unwrap().0
+                        handler.rx.recv_from(rx_buf).unwrap().0
                     } else {
-                        handler.rx.recv(&mut handler.rx_buf).unwrap()
+                        handler.rx.recv(rx_buf).unwrap()
                     };
 
                     unsafe { handler.rx_buf.set_len(cnt) };
@@ -940,7 +955,14 @@ impl UdpHandler {
         if let LISTENER = token {
             debug!("We are receiving a datagram now...");
             unsafe { self.rx_buf.set_len(self.rx_buf.capacity()) };
-            match self.rx.recv_from(&mut self.rx_buf) {
+            // TODO: replace with `Vec::spare_capacity_mut` once stable.
+            let rx_buf = unsafe {
+                slice::from_raw_parts_mut(
+                    self.rx_buf.as_mut_ptr() as *mut MaybeUninit<u8>,
+                    self.rx_buf.capacity(),
+                )
+            };
+            match self.rx.recv_from(rx_buf) {
                 Ok((cnt, addr)) => {
                     unsafe { self.rx_buf.set_len(cnt) };
                     assert_eq!(addr.ip(), self.localhost);
@@ -1048,7 +1070,7 @@ fn et_behavior_recv() {
 
     socket1.connect(address2).unwrap();
 
-    let mut buf = [0; 20];
+    let mut buf = [MaybeUninit::uninit(); 20];
     checked_write!(socket1.send(DATA1));
     expect_events(
         &mut poll,
@@ -1067,7 +1089,6 @@ fn et_behavior_recv() {
         vec![ExpectEvent::new(ID2, Interest::READABLE)],
     );
 
-    let mut buf = [0; 20];
     expect_read!(socket2.recv(&mut buf), DATA1);
 }
 
@@ -1113,7 +1134,7 @@ fn et_behavior_recv_from() {
         vec![ExpectEvent::new(ID2, Interest::READABLE)],
     );
 
-    let mut buf = [0; 20];
+    let mut buf = [MaybeUninit::uninit(); 20];
     expect_read!(socket2.recv_from(&mut buf), DATA1, address1);
 
     // this will reregister the socket2, resetting the interests
