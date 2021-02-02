@@ -1,12 +1,14 @@
 #![cfg(all(feature = "os-poll", feature = "net"))]
 
-use mio::net::{TcpListener, TcpSocket, TcpStream};
-use mio::{Events, Interest, Poll, Token};
 use std::io::{self, Read, Write};
+use std::mem::MaybeUninit;
 use std::net::{self, Shutdown};
 use std::sync::mpsc::channel;
 use std::thread::{self, sleep};
 use std::time::Duration;
+
+use mio::net::{TcpListener, TcpSocket, TcpStream};
+use mio::{Events, Interest, Poll, Token};
 
 #[macro_use]
 mod util;
@@ -257,12 +259,13 @@ fn peek() {
         socket: stream,
         shutdown: false,
     };
+    let mut buf = [MaybeUninit::uninit(); 1024];
+
     while !data.shutdown {
         poll.poll(&mut events, None).unwrap();
 
         for event in &events {
             assert_eq!(event.token(), Token(1));
-            let mut buf = [0; 1024];
             match data.socket.peek(&mut buf) {
                 Ok(_) => (),
                 Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => continue,
@@ -270,7 +273,7 @@ fn peek() {
             }
 
             loop {
-                if let Ok(amt) = data.socket.read(&mut buf) {
+                if let Ok(amt) = data.socket.recv(&mut buf) {
                     data.amt += amt;
                 } else {
                     break;

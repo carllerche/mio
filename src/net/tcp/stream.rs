@@ -1,13 +1,16 @@
 use std::fmt;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
+use std::mem::MaybeUninit;
 use std::net::{self, Shutdown, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket};
 
+use socket2::{Domain, Protocol, Socket, Type};
+
 use crate::io_source::IoSource;
-use crate::net::TcpSocket;
+use crate::net::convert_address;
 use crate::{event, Interest, Registry, Token};
 
 /// A non-blocking TCP stream between a local socket and a remote socket.
@@ -43,15 +46,57 @@ use crate::{event, Interest, Registry, Token};
 /// # }
 /// ```
 pub struct TcpStream {
-    inner: IoSource<net::TcpStream>,
+    inner: IoSource<Socket>,
 }
 
 impl TcpStream {
     /// Create a new TCP stream and issue a non-blocking connect to the
     /// specified address.
-    pub fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
-        let socket = TcpSocket::new_for_addr(addr)?;
-        socket.connect(addr)
+    pub fn connect(address: SocketAddr) -> io::Result<TcpStream> {
+        // Create a non-blocking socket.
+        let domain = Domain::for_address(address);
+        let ty = Type::STREAM;
+        // Use `SOCK_NONBLOCK` on platforms that support it.
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "linux",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        let ty = ty.nonblocking();
+        let socket = Socket::new(domain, ty, Some(Protocol::TCP))?;
+        // Platforms that don't support `SOCK_NONBLOCK`.
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "linux",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        )))]
+        socket.set_nonblocking(true)?;
+
+        // Connect the socket.
+        if let Err(err) = socket.connect(&address.into()) {
+            #[cfg(unix)]
+            if err.raw_os_error() != Some(libc::EINPROGRESS) {
+                return Err(err);
+            }
+            #[cfg(windows)]
+            if err.kind() != io::ErrorKind::WouldBlock {
+                return Err(err);
+            }
+        }
+
+        Ok(TcpStream {
+            inner: IoSource::new(socket),
+        })
     }
 
     /// Creates a new `TcpStream` from a standard `net::TcpStream`.
@@ -68,18 +113,18 @@ impl TcpStream {
     /// the standard library).
     pub fn from_std(stream: net::TcpStream) -> TcpStream {
         TcpStream {
-            inner: IoSource::new(stream),
+            inner: IoSource::new(stream.into()),
         }
     }
 
     /// Returns the socket address of the remote peer of this TCP connection.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.peer_addr()
+        self.inner.peer_addr().and_then(convert_address)
     }
 
     /// Returns the socket address of the local half of this TCP connection.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
+        self.inner.local_addr().and_then(convert_address)
     }
 
     /// Shuts down the read, write, or both halves of this connection.
@@ -162,61 +207,79 @@ impl TcpStream {
     }
 
     /// Receives data on the socket from the remote address to which it is
+    /// connected.
+    ///
+    /// Note that the [`io::Read::read`] implementation calls this function with
+    /// a `buf`fer of type `&mut [u8]`, allowing initialised buffers to be used
+    /// without using `unsafe`.
+    pub fn recv(&self, buf: &mut [MaybeUninit<u8>]) -> io::Result<usize> {
+        // When receiving into a zero-length buffer the address will not be
+        // initialised by the OS (at least not on macOS). Which means that it
+        // can't be converted into a `std::net::SocketAddr` properly and
+        // `convert_address` will return a misleading error.
+        debug_assert!(
+            !buf.is_empty(),
+            "called mio::TcpStream::recv_ with an empty buffer"
+        );
+        self.inner.do_io(|socket| socket.recv(buf))
+    }
+
+    /// Receives data on the socket from the remote address to which it is
     /// connected, without removing that data from the queue. On success,
     /// returns the number of bytes peeked.
     ///
     /// Successive calls return the same data. This is accomplished by passing
     /// `MSG_PEEK` as a flag to the underlying recv system call.
-    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+    pub fn peek(&self, buf: &mut [MaybeUninit<u8>]) -> io::Result<usize> {
         self.inner.peek(buf)
     }
 }
 
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.do_io(|inner| (&*inner).read(buf))
+        self.inner.do_io(|socket| (&*socket).read(buf))
     }
 
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        self.inner.do_io(|inner| (&*inner).read_vectored(bufs))
+        self.inner.do_io(|socket| (&*socket).read_vectored(bufs))
     }
 }
 
 impl<'a> Read for &'a TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.do_io(|inner| (&*inner).read(buf))
+        self.inner.do_io(|socket| (&*socket).read(buf))
     }
 
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        self.inner.do_io(|inner| (&*inner).read_vectored(bufs))
+        self.inner.do_io(|socket| (&*socket).read_vectored(bufs))
     }
 }
 
 impl Write for TcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.do_io(|inner| (&*inner).write(buf))
+        self.inner.do_io(|socket| (&*socket).write(buf))
     }
 
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        self.inner.do_io(|inner| (&*inner).write_vectored(bufs))
+        self.inner.do_io(|socket| (&*socket).write_vectored(bufs))
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.do_io(|inner| (&*inner).flush())
+        self.inner.do_io(|socket| (&*socket).flush())
     }
 }
 
 impl<'a> Write for &'a TcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.do_io(|inner| (&*inner).write(buf))
+        self.inner.do_io(|socket| (&*socket).write(buf))
     }
 
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        self.inner.do_io(|inner| (&*inner).write_vectored(bufs))
+        self.inner.do_io(|socket| (&*socket).write_vectored(bufs))
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.do_io(|inner| (&*inner).flush())
+        self.inner.do_io(|socket| (&*socket).flush())
     }
 }
 

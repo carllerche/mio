@@ -1,9 +1,11 @@
 // You can run this example from the root of the mio repo:
 // cargo run --example udp_server --features="os-poll udp"
-use log::warn;
+
+use std::mem::MaybeUninit;
+use std::{io, slice};
+
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token};
-use std::io;
 
 // A token to allow us to identify which event is for the `UdpSocket`.
 const UDP_SOCKET: Token = Token(0);
@@ -32,7 +34,7 @@ fn main() -> io::Result<()> {
 
     // Initialize a buffer for the UDP packet. We use the maximum size of a UDP
     // packet, which is the maximum value of 16 a bit integer.
-    let mut buf = [0; 1 << 16];
+    let mut buf = Vec::with_capacity(u16::MAX as usize);
 
     // Our event loop.
     loop {
@@ -47,10 +49,24 @@ fn main() -> io::Result<()> {
             match event.token() {
                 UDP_SOCKET => loop {
                     // In this loop we receive all packets queued for the socket.
-                    match socket.recv_from(&mut buf) {
+                    buf.clear();
+                    // TODO: replace with `Vec::spare_capacity_mut` once stable.
+                    let b = unsafe {
+                        slice::from_raw_parts_mut(
+                            buf.as_mut_ptr() as *mut MaybeUninit<u8>,
+                            buf.capacity(),
+                        )
+                    };
+                    match socket.recv_from(b) {
                         Ok((packet_size, source_address)) => {
+                            println!(
+                                "Got packet ({} bytes) from '{}'.",
+                                packet_size, source_address
+                            );
+                            // Safety: we've just received into the buffer.
+                            unsafe { buf.set_len(packet_size) }
                             // Echo the data.
-                            socket.send_to(&buf[..packet_size], source_address)?;
+                            socket.send_to(&buf, source_address)?;
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                             // If we get a `WouldBlock` error we know our socket
@@ -69,7 +85,7 @@ fn main() -> io::Result<()> {
                     // This should never happen as we only registered our
                     // `UdpSocket` using the `UDP_SOCKET` token, but if it ever
                     // does we'll log it.
-                    warn!("Got event for unexpected token: {:?}", event);
+                    eprintln!("Got event for unexpected token: {:?}", event);
                 }
             }
         }

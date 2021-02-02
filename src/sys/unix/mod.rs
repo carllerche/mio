@@ -27,7 +27,6 @@ cfg_os_poll! {
         mod net;
 
         pub(crate) mod tcp;
-        pub(crate) mod udp;
         pub(crate) mod uds;
         pub use self::uds::SocketAddr;
     }

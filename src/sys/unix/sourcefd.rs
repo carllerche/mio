@@ -25,8 +25,8 @@ use std::os::unix::io::RawFd;
 ///
 /// Basic usage.
 ///
-#[cfg_attr(all(feature = "os-poll", feature = "net"), doc = "```")]
-#[cfg_attr(not(all(feature = "os-poll", feature = "net")), doc = "```ignore")]
+#[cfg_attr(all(feature = "os-poll", feature = "os-ext"), doc = "```")]
+#[cfg_attr(not(all(feature = "os-poll", feature = "os-ext")), doc = "```ignore")]
 /// # use std::error::Error;
 /// # fn main() -> Result<(), Box<dyn Error>> {
 /// use mio::{Interest, Poll, Token};

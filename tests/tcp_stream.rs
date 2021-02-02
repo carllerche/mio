@@ -1,7 +1,7 @@
 #![cfg(all(feature = "os-poll", feature = "net"))]
 
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
-use std::mem::forget;
+use std::mem::{forget, MaybeUninit};
 use std::net::{self, Shutdown, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
@@ -82,9 +82,9 @@ where
         vec![ExpectEvent::new(ID1, Interest::WRITABLE)],
     );
 
-    let mut buf = [0; 16];
+    let mut buf = [MaybeUninit::uninit(); 16];
     assert_would_block(stream.peek(&mut buf));
-    assert_would_block(stream.read(&mut buf));
+    assert_would_block(stream.recv(&mut buf));
 
     // NOTE: the call to `peer_addr` must happen after we received a writable
     // event as the stream might not yet be connected.
@@ -102,10 +102,11 @@ where
     );
 
     expect_read!(stream.peek(&mut buf), DATA1);
-    expect_read!(stream.read(&mut buf), DATA1);
+    expect_read!(stream.recv(&mut buf), DATA1);
 
     assert!(stream.take_error().unwrap().is_none());
 
+    let mut buf = [0; 16];
     assert_would_block(stream.read(&mut buf));
 
     let bufs = [IoSlice::new(&DATA1), IoSlice::new(&DATA2)];
@@ -494,9 +495,9 @@ fn no_events_after_deregister() {
     assert_eq!(stream.peer_addr().unwrap(), address);
 
     // Also, write should work
-    let mut buf = [0; 16];
+    let mut buf = [MaybeUninit::uninit(); 16];
     assert_would_block(stream.peek(&mut buf));
-    assert_would_block(stream.read(&mut buf));
+    assert_would_block(stream.recv(&mut buf));
 
     checked_write!(stream.write(&DATA1));
     stream.flush().unwrap();
