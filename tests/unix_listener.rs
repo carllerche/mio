@@ -133,6 +133,59 @@ fn unix_listener_deregister() {
     handle.join().unwrap();
 }
 
+// Only `kqueue(2)` supports hints in event.
+#[test]
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn event_hint() {
+    use std::time::Duration;
+
+    use mio::event::Hint;
+
+    let (mut poll, mut events) = init_with_poll();
+
+    let path = temp_file("unix_listener_event_hint");
+    let mut listener = UnixListener::bind(&path).unwrap();
+
+    const N: usize = 5;
+    let barrier = Arc::new(Barrier::new(N + 1));
+    let thread_handles = (0..N)
+        .map(|_| open_connections(path.clone(), 1, barrier.clone()))
+        .collect::<Vec<_>>();
+
+    poll.registry()
+        .register(&mut listener, TOKEN_1, Interest::READABLE)
+        .unwrap();
+
+    // Give the streams some time to start.
+    thread::sleep(Duration::from_millis(200));
+
+    poll.poll(&mut events, Some(Duration::from_secs(1)))
+        .unwrap();
+    assert_eq!(events.iter().count(), 1);
+
+    // Expect the hint to contain the number of connections in the backlog.
+    let event = events.iter().nth(0).unwrap();
+    assert_eq!(event.token(), TOKEN_1);
+    assert_eq!(
+        event.hint(),
+        Some(Hint::Readable(N)),
+        "missing hint: {:#?}",
+        event
+    );
+
+    barrier.wait();
+    for handle in thread_handles {
+        handle.join().expect("unable to join thread");
+    }
+}
+
 fn smoke_test<F>(new_listener: F, test_name: &'static str)
 where
     F: FnOnce(&Path) -> io::Result<UnixListener>,

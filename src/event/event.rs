@@ -174,6 +174,11 @@ impl Event {
         sys::event::is_lio(&self.inner)
     }
 
+    /// Returns a hint available in the event.
+    pub fn hint(&self) -> Option<Hint> {
+        sys::event::hint(&self.inner)
+    }
+
     /// Create a reference to an `Event` from a platform specific event.
     pub(crate) fn from_sys_event_ref(sys_event: &sys::Event) -> &Event {
         unsafe {
@@ -182,6 +187,32 @@ impl Event {
             &*(sys_event as *const sys::Event as *const Event)
         }
     }
+}
+
+/// An optional hint contained in an [`Event`].
+#[derive(Debug, Eq, PartialEq)]
+pub enum Hint {
+    /// For readable event sources, such as readable sockets ([`TcpStream`] or
+    /// [`UdpSocket`]) or reading side of [Unix pipe], this contains the number
+    /// of bytes available to read.
+    ///
+    /// For listening sockets, such as [`TcpListener`] or [`UnixListener`], this
+    /// returns the size of the listen backlog.
+    ///
+    /// [`TcpStream`]: crate::net::TcpStream
+    /// [`UdpSocket`]: crate::net::UdpSocket
+    /// [Unix pipe]: crate::unix::pipe::Receiver
+    /// [`TcpListener`]: crate::net::TcpListener
+    /// [`UnixListener`]: crate::net::UnixListener
+    Readable(usize),
+    /// For writeable event sources, such as writeable sockets ([`TcpStream`] or
+    /// [`UdpSocket`]) or writing side of [Unix pipe], this returns the amount
+    /// of space remaining in the write buffer.
+    ///
+    /// [`TcpStream`]: crate::net::TcpStream
+    /// [`UdpSocket`]: crate::net::UdpSocket
+    /// [Unix pipe]: crate::unix::pipe::Sender
+    Writable(usize),
 }
 
 /// When the [alternate] flag is enabled this will print platform specific
@@ -202,7 +233,8 @@ impl fmt::Debug for Event {
             .field("write_closed", &self.is_write_closed())
             .field("priority", &self.is_priority())
             .field("aio", &self.is_aio())
-            .field("lio", &self.is_lio());
+            .field("lio", &self.is_lio())
+            .field("hint", &self.hint());
 
         if alternate {
             struct EventDetails<'a>(&'a sys::Event);

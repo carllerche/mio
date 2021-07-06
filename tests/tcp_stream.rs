@@ -693,6 +693,83 @@ fn tcp_shutdown_client_both_close_event() {
     handle.join().expect("failed to join thread");
 }
 
+// Only `kqueue(2)` supports hints in event.
+#[test]
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn event_hint() {
+    use std::time::Duration;
+
+    use mio::event::Hint;
+
+    let (mut poll, mut events) = init_with_poll();
+
+    let (handle, address) = echo_listener(any_local_address(), 1);
+    let mut stream = TcpStream::connect(address).unwrap();
+
+    poll.registry()
+        .register(&mut stream, ID1, Interest::READABLE.add(Interest::WRITABLE))
+        .unwrap();
+
+    poll.poll(&mut events, Some(Duration::from_secs(1)))
+        .unwrap();
+    assert!(events.iter().count() >= 1);
+
+    let mut checked = false;
+    for event in events.iter() {
+        if !event.is_writable() {
+            continue;
+        }
+        assert_eq!(event.token(), ID1);
+
+        // Expect the hint to contain the number of bytes send.
+        if !matches!(event.hint(), Some(Hint::Writable(..))) {
+            panic!("missing hint: {:#?}", event);
+        }
+        checked = true;
+    }
+    assert!(checked, "missing writable event: {:?}", events);
+
+    let n = stream.write(DATA1).unwrap();
+    assert_eq!(n, DATA1.len());
+
+    poll.poll(&mut events, Some(Duration::from_secs(1)))
+        .unwrap();
+    assert!(events.iter().count() >= 1);
+
+    let mut checked = false;
+    for event in events.iter() {
+        if !event.is_readable() {
+            continue;
+        }
+        assert_eq!(event.token(), ID1);
+
+        // Expect the hint to contain the number of bytes send.
+        assert_eq!(
+            event.hint(),
+            Some(Hint::Readable(DATA1.len())),
+            "missing hint: {:#?}",
+            event
+        );
+        checked = true;
+    }
+    assert!(checked, "missing readable event: {:?}", events);
+
+    let mut buf = [0; 20];
+    let n = stream.read(&mut buf).unwrap();
+    assert_eq!(n, DATA1.len());
+    assert_eq!(&buf[..n], &*DATA1);
+
+    drop(stream);
+    handle.join().expect("failed to join thread");
+}
+
 /// Start a listener that accepts `n_connections` connections on the returned
 /// address. It echos back any data it reads from the connection before
 /// accepting another one.

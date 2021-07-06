@@ -3,6 +3,7 @@ use std::fmt;
 use miow::iocp::CompletionStatus;
 
 use super::afd;
+use crate::event::Hint;
 use crate::Token;
 
 #[derive(Clone)]
@@ -87,6 +88,10 @@ pub fn is_aio(_: &Event) -> bool {
 pub fn is_lio(_: &Event) -> bool {
     // Not supported.
     false
+}
+
+pub fn hint(_: &Event) -> Option<Hint> {
+    None
 }
 
 pub fn debug_details(f: &mut fmt::Formatter<'_>, event: &Event) -> fmt::Result {

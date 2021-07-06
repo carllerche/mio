@@ -66,6 +66,8 @@ pub mod event {
     use crate::Token;
     use std::fmt;
 
+    use crate::event::Hint;
+
     pub fn token(_: &Event) -> Token {
         os_required!();
     }
@@ -100,6 +102,10 @@ pub mod event {
 
     pub fn is_lio(_: &Event) -> bool {
         os_required!();
+    }
+
+    pub fn hint(_: &Event) -> Option<Hint> {
+        None
     }
 
     pub fn debug_details(_: &mut fmt::Formatter<'_>, _: &Event) -> fmt::Result {

@@ -360,6 +360,7 @@ unsafe impl Sync for Events {}
 pub mod event {
     use std::fmt;
 
+    use crate::event::Hint;
     use crate::sys::Event;
     use crate::Token;
 
@@ -440,6 +441,14 @@ pub mod event {
         #[cfg(not(target_os = "freebsd"))]
         {
             false
+        }
+    }
+
+    pub fn hint(event: &Event) -> Option<Hint> {
+        match event.filter {
+            libc::EVFILT_READ => Some(Hint::Readable(event.data as usize)),
+            libc::EVFILT_WRITE => Some(Hint::Writable(event.data as usize)),
+            _ => None,
         }
     }
 

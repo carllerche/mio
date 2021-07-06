@@ -404,6 +404,88 @@ fn unix_stream_deregister() {
     handle.join().unwrap();
 }
 
+// Only `kqueue(2)` supports hints in event.
+#[test]
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn event_hint() {
+    use std::time::Duration;
+
+    use mio::event::Hint;
+
+    let (mut poll, mut events) = init_with_poll();
+
+    let (handle, remote_addr) = new_echo_listener(1, "unix_stream_event_hint");
+    let path = remote_addr.as_pathname().expect("failed to get pathname");
+    let mut stream = UnixStream::connect(path).unwrap();
+
+    poll.registry()
+        .register(
+            &mut stream,
+            TOKEN_1,
+            Interest::READABLE.add(Interest::WRITABLE),
+        )
+        .unwrap();
+
+    poll.poll(&mut events, Some(Duration::from_secs(1)))
+        .unwrap();
+    assert!(events.iter().count() >= 1);
+
+    let mut checked = false;
+    for event in events.iter() {
+        if !event.is_writable() {
+            continue;
+        }
+        assert_eq!(event.token(), TOKEN_1);
+
+        // Expect the hint to contain the number of bytes send.
+        if !matches!(event.hint(), Some(Hint::Writable(..))) {
+            panic!("missing hint: {:#?}", event);
+        }
+        checked = true;
+    }
+    assert!(checked, "missing writable event: {:?}", events);
+
+    let n = stream.write(DATA1).unwrap();
+    assert_eq!(n, DATA1.len());
+
+    poll.poll(&mut events, Some(Duration::from_secs(1)))
+        .unwrap();
+    assert!(events.iter().count() >= 1);
+
+    let mut checked = false;
+    for event in events.iter() {
+        if !event.is_readable() {
+            continue;
+        }
+        assert_eq!(event.token(), TOKEN_1);
+
+        // Expect the hint to contain the number of bytes send.
+        assert_eq!(
+            event.hint(),
+            Some(Hint::Readable(DATA1.len())),
+            "missing hint: {:#?}",
+            event
+        );
+        checked = true;
+    }
+    assert!(checked, "missing readable event: {:?}", events);
+
+    let mut buf = [0; 20];
+    let n = stream.read(&mut buf).unwrap();
+    assert_eq!(n, DATA1.len());
+    assert_eq!(&buf[..n], &*DATA1);
+
+    drop(stream);
+    handle.join().expect("failed to join thread");
+}
+
 fn smoke_test<F>(connect_stream: F, test_name: &'static str)
 where
     F: FnOnce(&Path) -> io::Result<UnixStream>,

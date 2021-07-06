@@ -149,6 +149,7 @@ pub type Events = Vec<Event>;
 pub mod event {
     use std::fmt;
 
+    use crate::event::Hint;
     use crate::sys::Event;
     use crate::Token;
 
@@ -199,6 +200,10 @@ pub mod event {
     pub fn is_lio(_: &Event) -> bool {
         // Not supported.
         false
+    }
+
+    pub fn hint(_: &Event) -> Option<Hint> {
+        None
     }
 
     pub fn debug_details(f: &mut fmt::Formatter<'_>, event: &Event) -> fmt::Result {

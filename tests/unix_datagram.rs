@@ -275,6 +275,86 @@ fn unix_datagram_deregister() {
     expect_no_events(&mut poll, &mut events);
 }
 
+// Only `kqueue(2)` supports hints in event.
+#[test]
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn event_hint() {
+    use std::time::Duration;
+
+    use mio::event::Hint;
+
+    let (mut poll, mut events) = init_with_poll();
+
+    let path1 = temp_file("unix_datagram_event_hint1");
+    let path2 = temp_file("unix_datagram_event_hint2");
+
+    let mut datagram1 = UnixDatagram::bind(&path1).unwrap();
+
+    poll.registry()
+        .register(
+            &mut datagram1,
+            TOKEN_1,
+            Interest::READABLE.add(Interest::WRITABLE),
+        )
+        .unwrap();
+
+    poll.poll(&mut events, Some(Duration::from_secs(1)))
+        .unwrap();
+    assert!(events.iter().count() >= 1);
+
+    let mut checked = false;
+    for event in events.iter() {
+        if !event.is_writable() {
+            continue;
+        }
+        assert_eq!(event.token(), TOKEN_1);
+
+        // Expect the hint to contain the number of bytes send.
+        if !matches!(event.hint(), Some(Hint::Writable(..))) {
+            panic!("missing hint: {:#?}", event);
+        }
+        checked = true;
+    }
+    assert!(checked, "missing writable event: {:?}", events);
+
+    let datagram2 = net::UnixDatagram::bind(&path2).unwrap();
+    datagram2.send_to(DATA1, path1).unwrap();
+
+    poll.poll(&mut events, Some(Duration::from_secs(1)))
+        .unwrap();
+    assert!(events.iter().count() >= 1);
+
+    let mut checked = false;
+    for event in events.iter() {
+        if !event.is_readable() {
+            continue;
+        }
+        assert_eq!(event.token(), TOKEN_1);
+
+        // Expect the hint to contain the number of bytes send.
+        assert_eq!(
+            event.hint(),
+            Some(Hint::Readable(DATA1.len())),
+            "missing hint: {:#?}",
+            event
+        );
+        checked = true;
+    }
+    assert!(checked, "missing readable event: {:?}", events);
+
+    let mut buf = [0; 20];
+    let n = datagram1.recv(&mut buf).unwrap();
+    assert_eq!(n, DATA1.len());
+    assert_eq!(&buf[..n], &*DATA1);
+}
+
 fn smoke_test_unconnected(mut datagram1: UnixDatagram, mut datagram2: UnixDatagram) {
     let (mut poll, mut events) = init_with_poll();
 

@@ -1130,3 +1130,82 @@ fn et_behavior_recv_from() {
     assert!(socket1.take_error().unwrap().is_none());
     assert!(socket2.take_error().unwrap().is_none());
 }
+
+// Only `kqueue(2)` supports hints in event.
+#[test]
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn event_hint() {
+    use std::time::Duration;
+
+    use mio::event::Hint;
+
+    let (mut poll, mut events) = init_with_poll();
+
+    let mut socket = UdpSocket::bind(any_local_address()).unwrap();
+    let address = socket.local_addr().unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let handle = send_packets(address, 1, barrier.clone());
+
+    poll.registry()
+        .register(&mut socket, ID1, Interest::READABLE.add(Interest::WRITABLE))
+        .unwrap();
+
+    poll.poll(&mut events, Some(Duration::from_secs(1)))
+        .unwrap();
+    assert!(events.iter().count() >= 1);
+
+    let mut checked = false;
+    for event in events.iter() {
+        if !event.is_writable() {
+            continue;
+        }
+        assert_eq!(event.token(), ID1);
+
+        // Expect the hint to contain the number of bytes send.
+        if !matches!(event.hint(), Some(Hint::Writable(..))) {
+            panic!("missing hint: {:#?}", event);
+        }
+        checked = true;
+    }
+    assert!(checked, "missing writable event: {:?}", events);
+
+    // Let the other end send a packet.
+    barrier.wait();
+
+    poll.poll(&mut events, Some(Duration::from_secs(1)))
+        .unwrap();
+    assert!(events.iter().count() >= 1);
+
+    let mut checked = false;
+    for event in events.iter() {
+        if !event.is_readable() {
+            continue;
+        }
+        assert_eq!(event.token(), ID1);
+
+        // Expect the hint to contain the number of bytes send.
+        assert_eq!(
+            event.hint(),
+            Some(Hint::Readable(DATA1.len())),
+            "missing hint: {:#?}",
+            event
+        );
+        checked = true;
+    }
+    assert!(checked, "missing readable event: {:?}", events);
+
+    let mut buf = [0; 20];
+    let n = socket.recv(&mut buf).unwrap();
+    assert_eq!(n, DATA1.len());
+    assert_eq!(&buf[..n], &*DATA1);
+
+    handle.join().expect("failed to join thread");
+}

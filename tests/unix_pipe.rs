@@ -10,7 +10,7 @@ use mio::unix::pipe::{self, Receiver, Sender};
 use mio::{Events, Interest, Poll, Token};
 
 mod util;
-use util::{assert_would_block, expect_events, ExpectEvent};
+use util::{assert_would_block, expect_events, init_with_poll, ExpectEvent};
 
 const RECEIVER: Token = Token(0);
 const SENDER: Token = Token(1);
@@ -19,8 +19,7 @@ const DATA1: &[u8; 11] = b"Hello world";
 
 #[test]
 fn smoke() {
-    let mut poll = Poll::new().unwrap();
-    let mut events = Events::with_capacity(8);
+    let (mut poll, mut events) = init_with_poll();
 
     let (mut sender, mut receiver) = pipe::new().unwrap();
 
@@ -54,8 +53,7 @@ fn smoke() {
 
 #[test]
 fn event_when_sender_is_dropped() {
-    let mut poll = Poll::new().unwrap();
-    let mut events = Events::with_capacity(8);
+    let (mut poll, mut events) = init_with_poll();
 
     let (mut sender, mut receiver) = pipe::new().unwrap();
     poll.registry()
@@ -92,8 +90,7 @@ fn event_when_sender_is_dropped() {
 
 #[test]
 fn event_when_receiver_is_dropped() {
-    let mut poll = Poll::new().unwrap();
-    let mut events = Events::with_capacity(8);
+    let (mut poll, mut events) = init_with_poll();
 
     let (mut sender, receiver) = pipe::new().unwrap();
     poll.registry()
@@ -125,6 +122,8 @@ fn event_when_receiver_is_dropped() {
 
 #[test]
 fn from_child_process_io() {
+    let (mut poll, mut events) = init_with_poll();
+
     // `cat` simply echo everything that we write via standard in.
     let mut child = Command::new("cat")
         .env_clear()
@@ -135,9 +134,6 @@ fn from_child_process_io() {
 
     let mut sender = Sender::from(child.stdin.take().unwrap());
     let mut receiver = Receiver::from(child.stdout.take().unwrap());
-
-    let mut poll = Poll::new().unwrap();
-    let mut events = Events::with_capacity(8);
 
     poll.registry()
         .register(&mut receiver, RECEIVER, Interest::READABLE)
@@ -191,6 +187,82 @@ fn nonblocking_child_process_io() {
 
     drop(sender);
     child.wait().unwrap();
+}
+
+// Only `kqueue(2)` supports hints in event.
+#[test]
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn event_hint() {
+    use std::time::Duration;
+
+    use mio::event::Hint;
+
+    let (mut poll, mut events) = init_with_poll();
+
+    let (mut sender, mut receiver) = pipe::new().unwrap();
+
+    poll.registry()
+        .register(&mut receiver, RECEIVER, Interest::READABLE)
+        .unwrap();
+    poll.registry()
+        .register(&mut sender, SENDER, Interest::WRITABLE)
+        .unwrap();
+
+    poll.poll(&mut events, Some(Duration::from_secs(1)))
+        .unwrap();
+    assert!(events.iter().count() >= 1);
+
+    let mut checked = false;
+    for event in events.iter() {
+        if !event.is_writable() {
+            continue;
+        }
+        assert_eq!(event.token(), SENDER);
+
+        // Expect the hint to contain the number of bytes send.
+        if !matches!(event.hint(), Some(Hint::Writable(..))) {
+            panic!("missing hint: {:#?}", event);
+        }
+        checked = true;
+    }
+    assert!(checked, "missing writable event: {:?}", events);
+
+    let n = sender.write(DATA1).unwrap();
+    assert_eq!(n, DATA1.len());
+
+    poll.poll(&mut events, Some(Duration::from_secs(1)))
+        .unwrap();
+    assert!(events.iter().count() >= 1);
+
+    let mut checked = false;
+    for event in events.iter() {
+        if !event.is_readable() {
+            continue;
+        }
+        assert_eq!(event.token(), RECEIVER);
+
+        // Expect the hint to contain the number of bytes send.
+        assert_eq!(
+            event.hint(),
+            Some(Hint::Readable(DATA1.len())),
+            "missing hint: {:#?}",
+            event
+        );
+        checked = true;
+    }
+    assert!(checked, "missing readable event: {:?}", events);
+
+    let mut buf = [0; 20];
+    let n = receiver.read(&mut buf).unwrap();
+    assert_eq!(n, DATA1.len());
+    assert_eq!(&buf[..n], &*DATA1);
 }
 
 /// Expected a closed event. If `read` is true is checks for `is_read_closed`,
