@@ -335,6 +335,20 @@ impl Drop for TcpSocket {
     }
 }
 
+impl From<&TcpStream> for TcpSocket {
+    fn from(stream: &TcpStream) -> TcpSocket {
+        #[cfg(unix)]
+            {
+                unsafe { TcpSocket::from_raw_fd(stream.as_raw_fd()) }
+            }
+
+        #[cfg(windows)]
+            {
+                unsafe { TcpSocket::from_raw_socket(stream.as_raw_socket())}
+            }
+    }
+}
+
 #[cfg(unix)]
 impl IntoRawFd for TcpSocket {
     fn into_raw_fd(self) -> RawFd {

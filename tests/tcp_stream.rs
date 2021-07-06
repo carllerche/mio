@@ -810,3 +810,16 @@ fn set_linger_zero(socket: &TcpStream) {
     s.set_linger(Some(Duration::from_millis(0))).unwrap();
     forget(s);
 }
+
+#[test]
+fn set_linger() {
+    let listener = net::TcpListener::bind(any_local_address()).unwrap();
+
+    let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+
+    stream.set_linger(Some(Duration::from_secs(1))).unwrap();
+    assert_eq!(stream.linger().unwrap().unwrap().as_secs(), 1);
+
+    stream.set_linger(None).unwrap();
+    assert!(stream.linger().unwrap().is_none());
+}
