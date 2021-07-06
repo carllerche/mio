@@ -540,6 +540,64 @@ impl UdpSocket {
         sys::udp::only_v6(&self.inner)
     }
 
+    /// Sets the value of `SO_RCVBUF` on this socket.
+    pub fn set_recv_buffer_size(&self, size: u32) -> io::Result<()> {
+        sys::udp::set_recv_buffer_size(&self.inner, size)
+    }
+
+    /// Get the value of `SO_RCVBUF` set on this socket.
+    ///
+    /// Note that if [`set_recv_buffer_size`] has been called on this socket
+    /// previously, the value returned by this function may not be the same as
+    /// the argument provided to `set_recv_buffer_size`. This is for the
+    /// following reasons:
+    ///
+    /// * Most operating systems have minimum and maximum allowed sizes for the
+    ///   receive buffer, and will clamp the provided value if it is below the
+    ///   minimum or above the maximum. The minimum and maximum buffer sizes are
+    ///   OS-dependent.
+    /// * Linux will double the buffer size to account for internal bookkeeping
+    ///   data, and returns the doubled value from `getsockopt(2)`. As per `man
+    ///   7 socket`:
+    ///   > Sets or gets the maximum socket receive buffer in bytes. The
+    ///   > kernel doubles this value (to allow space for bookkeeping
+    ///   > overhead) when it is set using `setsockopt(2)`, and this doubled
+    ///   > value is returned by `getsockopt(2)`.
+    ///
+    /// [`set_recv_buffer_size`]: #method.set_recv_buffer_size
+    pub fn recv_buffer_size(&self) -> io::Result<u32> {
+        sys::udp::recv_buffer_size(&self.inner)
+    }
+
+    /// Sets the value of `SO_SNDBUF` on this socket.
+    pub fn set_send_buffer_size(&self, size: u32) -> io::Result<()> {
+        sys::udp::set_send_buffer_size(&self.inner, size)
+    }
+
+    /// Get the value of `SO_SNDBUF` set on this socket.
+    ///
+    /// Note that if [`set_send_buffer_size`] has been called on this socket
+    /// previously, the value returned by this function may not be the same as
+    /// the argument provided to `set_send_buffer_size`. This is for the
+    /// following reasons:
+    ///
+    /// * Most operating systems have minimum and maximum allowed sizes for the
+    ///   receive buffer, and will clamp the provided value if it is below the
+    ///   minimum or above the maximum. The minimum and maximum buffer sizes are
+    ///   OS-dependent.
+    /// * Linux will double the buffer size to account for internal bookkeeping
+    ///   data, and returns the doubled value from `getsockopt(2)`. As per `man
+    ///   7 socket`:
+    ///   > Sets or gets the maximum socket send buffer in bytes. The
+    ///   > kernel doubles this value (to allow space for bookkeeping
+    ///   > overhead) when it is set using `setsockopt(2)`, and this doubled
+    ///   > value is returned by `getsockopt(2)`.
+    ///
+    /// [`set_send_buffer_size`]: #method.set_send_buffer_size
+    pub fn send_buffer_size(&self) -> io::Result<u32> {
+        sys::udp::send_buffer_size(&self.inner)
+    }
+
     /// Get the value of the `SO_ERROR` option on this socket.
     ///
     /// This will retrieve the stored error in the underlying socket, clearing

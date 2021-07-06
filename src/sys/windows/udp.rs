@@ -1,3 +1,4 @@
+use std::convert::TryInto;
 use std::io;
 use std::mem::{self, MaybeUninit};
 use std::net::{self, SocketAddr};
@@ -7,7 +8,10 @@ use std::os::windows::raw::SOCKET as StdSocket; // winapi uses usize, stdlib use
 use winapi::ctypes::c_int;
 use winapi::shared::ws2def::IPPROTO_IPV6;
 use winapi::shared::ws2ipdef::IPV6_V6ONLY;
-use winapi::um::winsock2::{bind as win_bind, closesocket, getsockopt, SOCKET_ERROR, SOCK_DGRAM};
+use winapi::um::winsock2::{
+    bind as win_bind, closesocket, getsockopt, setsockopt, SOCKET, SOCKET_ERROR, SOCK_DGRAM,
+    SOL_SOCKET, SO_RCVBUF, SO_SNDBUF,
+};
 
 use crate::sys::windows::net::{init, new_ip_socket, socket_addr};
 
@@ -36,7 +40,7 @@ pub(crate) fn only_v6(socket: &net::UdpSocket) -> io::Result<bool> {
 
     syscall!(
         getsockopt(
-            socket.as_raw_socket() as usize,
+            socket.as_raw_socket() as SOCKET,
             IPPROTO_IPV6 as c_int,
             IPV6_V6ONLY as c_int,
             optval.as_mut_ptr().cast(),
@@ -50,4 +54,84 @@ pub(crate) fn only_v6(socket: &net::UdpSocket) -> io::Result<bool> {
     // Safety: `getsockopt` initialised `optval` for us.
     let optval = unsafe { optval.assume_init() };
     Ok(optval != 0)
+}
+
+pub(crate) fn set_recv_buffer_size(socket: &net::UdpSocket, size: u32) -> io::Result<()> {
+    let size = size.try_into().ok().unwrap_or_else(i32::max_value);
+
+    syscall!(
+        setsockopt(
+            socket.as_raw_socket() as SOCKET,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            &size as *const _ as *const _,
+            mem::size_of::<c_int>() as c_int
+        ),
+        PartialEq::eq,
+        SOCKET_ERROR
+    )?;
+
+    Ok(())
+}
+
+pub(crate) fn recv_buffer_size(socket: &net::UdpSocket) -> io::Result<u32> {
+    let mut optval: MaybeUninit<c_int> = MaybeUninit::uninit();
+    let mut optlen = mem::size_of::<c_int>() as c_int;
+
+    syscall!(
+        getsockopt(
+            socket.as_raw_socket() as SOCKET,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            &mut optval as *mut _ as *mut _,
+            &mut optlen,
+        ),
+        PartialEq::eq,
+        SOCKET_ERROR
+    )?;
+
+    debug_assert_eq!(optlen as usize, mem::size_of::<c_int>());
+    // Safety: `getsockopt` initialised `optval` for us.
+    let optval = unsafe { optval.assume_init() };
+    Ok(optval as u32)
+}
+
+pub(crate) fn set_send_buffer_size(socket: &net::UdpSocket, size: u32) -> io::Result<()> {
+    let size = size.try_into().ok().unwrap_or_else(i32::max_value);
+
+    syscall!(
+        setsockopt(
+            socket.as_raw_socket() as SOCKET,
+            SOL_SOCKET,
+            SO_SNDBUF,
+            &size as *const _ as *const _,
+            mem::size_of::<c_int>() as c_int
+        ),
+        PartialEq::eq,
+        SOCKET_ERROR
+    )?;
+
+    Ok(())
+}
+
+pub(crate) fn send_buffer_size(socket: &net::UdpSocket) -> io::Result<u32> {
+    let mut optval: MaybeUninit<c_int> = MaybeUninit::uninit();
+    let mut optlen = mem::size_of::<c_int>() as c_int;
+
+    syscall!(
+        getsockopt(
+            socket.as_raw_socket() as SOCKET,
+            SOL_SOCKET,
+            SO_SNDBUF,
+            &mut optval as *mut _ as *mut _,
+            &mut optlen,
+        ),
+        PartialEq::eq,
+        SOCKET_ERROR
+    )?;
+
+    debug_assert_eq!(optlen as usize, mem::size_of::<c_int>());
+    // Safety: `getsockopt` initialised `optval` for us.
+    let optval = unsafe { optval.assume_init() };
+    Ok(optval as u32)
 }

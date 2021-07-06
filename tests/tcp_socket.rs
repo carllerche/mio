@@ -186,7 +186,7 @@ fn test_buffer_sizes(
         // Note that this doesn't assert that the values are equal: on Linux,
         // the kernel doubles the requested buffer size, and returns the doubled
         // value from `getsockopt`. As per `man socket(7)`:
-        // > Sets or gets the maximum socket send buffer in bytes.  The
+        // > Sets or gets the maximum socket send/receive buffer in bytes. The
         // > kernel doubles this value (to allow space for bookkeeping
         // > overhead) when it is set using setsockopt(2), and this doubled
         // > value is returned by getsockopt(2).

@@ -3,6 +3,7 @@
 use log::{debug, info};
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Registry, Token};
+use std::io;
 use std::net::{self, IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
@@ -1129,4 +1130,42 @@ fn et_behavior_recv_from() {
 
     assert!(socket1.take_error().unwrap().is_none());
     assert!(socket2.take_error().unwrap().is_none());
+}
+
+#[test]
+fn send_buffer_size_roundtrips() {
+    test_buffer_sizes(UdpSocket::set_send_buffer_size, UdpSocket::send_buffer_size)
+}
+
+#[test]
+fn recv_buffer_size_roundtrips() {
+    test_buffer_sizes(UdpSocket::set_recv_buffer_size, UdpSocket::recv_buffer_size)
+}
+
+// Helper for testing send/recv buffer size.
+fn test_buffer_sizes(
+    set: impl Fn(&UdpSocket, u32) -> io::Result<()>,
+    get: impl Fn(&UdpSocket) -> io::Result<u32>,
+) {
+    let test = |size: u32| {
+        println!("testing buffer size: {}", size);
+        let socket = UdpSocket::bind(any_local_address()).unwrap();
+        set(&socket, size).unwrap();
+        // Note that this doesn't assert that the values are equal: on Linux,
+        // the kernel doubles the requested buffer size, and returns the doubled
+        // value from `getsockopt`. As per `man socket(7)`:
+        // > Sets or gets the maximum socket send/receive buffer in bytes. The
+        // > kernel doubles this value (to allow space for bookkeeping
+        // > overhead) when it is set using setsockopt(2), and this doubled
+        // > value is returned by getsockopt(2).
+        //
+        // Additionally, the buffer size may be clamped above a minimum value,
+        // and this minimum value is OS-dependent.
+        let actual = get(&socket).unwrap();
+        assert!(actual >= size, "\tactual: {}\n\texpected: {}", actual, size);
+    };
+
+    test(256);
+    test(4096);
+    test(65512);
 }
