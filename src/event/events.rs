@@ -223,6 +223,8 @@ impl<'a> Iterator for Iter<'a> {
     }
 }
 
+impl<'a> ExactSizeIterator for Iter<'a> {}
+
 impl fmt::Debug for Events {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self).finish()
