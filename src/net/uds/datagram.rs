@@ -30,6 +30,14 @@ impl UnixDatagram {
         }
     }
 
+    /// Convert into a `net::UnixDatagram` from the standard library.
+    ///
+    /// No assumptions should be made as to the state of the Unix datagram.
+    /// It's up to the user to configure it for the intended usage.
+    pub fn into_std(self) -> net::UnixDatagram {
+        self.inner.into_inner()
+    }
+
     /// Connects the socket to the specified address.
     pub fn connect<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         self.inner.connect(path)

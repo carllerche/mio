@@ -78,6 +78,14 @@ impl TcpListener {
         }
     }
 
+    /// Convert into a `net::TcpListener` from the standard library.
+    ///
+    /// No assumptions should be made as to the state of the TCP listener.
+    /// It's up to the user to configure it for the intended usage.
+    pub fn into_std(self) -> net::TcpListener {
+        self.inner.into_inner()
+    }
+
     /// Accepts a new `TcpStream`.
     ///
     /// This may return an `Err(e)` where `e.kind()` is

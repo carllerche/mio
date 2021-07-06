@@ -134,6 +134,14 @@ impl UdpSocket {
         }
     }
 
+    /// Convert into a `net::UdpSocket` from the standard library.
+    ///
+    /// No assumptions should be made as to the state of the UDP socket.
+    /// It's up to the user to configure it for the intended usage.
+    pub fn into_std(self) -> net::UdpSocket {
+        self.inner.into_inner()
+    }
+
     /// Returns the socket address that this socket was created from.
     ///
     /// # Examples

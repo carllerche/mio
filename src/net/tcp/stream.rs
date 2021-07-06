@@ -72,6 +72,14 @@ impl TcpStream {
         }
     }
 
+    /// Convert into a `net::TcpStream` from the standard library.
+    ///
+    /// No assumptions should be made as to the state of the TCP stream.
+    /// It's up to the user to configure it for the intended usage.
+    pub fn into_std(self) -> net::TcpStream {
+        self.inner.into_inner()
+    }
+
     /// Returns the socket address of the remote peer of this TCP connection.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.inner.peer_addr()

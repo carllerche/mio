@@ -37,6 +37,14 @@ impl UnixStream {
         }
     }
 
+    /// Convert into a `net::UnixStream` from the standard library.
+    ///
+    /// No assumptions should be made as to the state of the Unix stream.
+    /// It's up to the user to configure it for the intended usage.
+    pub fn into_std(self) -> net::UnixStream {
+        self.inner.into_inner()
+    }
+
     /// Creates an unnamed pair of connected sockets.
     ///
     /// Returns two `UnixStream`s which are connected to each other.

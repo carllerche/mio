@@ -30,6 +30,14 @@ impl UnixListener {
         }
     }
 
+    /// Convert into a `net::UnixListener` from the standard library.
+    ///
+    /// No assumptions should be made as to the state of the Unix listener.
+    /// It's up to the user to configure it for the intended usage.
+    pub fn into_std(self) -> net::UnixListener {
+        self.inner.into_inner()
+    }
+
     /// Accepts a new incoming connection to this listener.
     ///
     /// The call is responsible for ensuring that the listening socket is in
